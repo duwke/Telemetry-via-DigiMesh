@@ -82,6 +82,7 @@ class XBee2UDP(object):
         self.ip = ip
 
         # Initialize XBee device connection
+        logging.warn(str(serial_port) + " " + str(baud_rate))
         self.xbee = XBeeDevice(port=serial_port, baud_rate=baud_rate, **kwargs)
         while not self.xbee.is_open():
             try:
@@ -141,6 +142,7 @@ class XBee2UDP(object):
         """
         # Extract information
         data = request_message.data
+        logging.warn("unpacked data " + str(data))
         identifier, port = struct.unpack('>BH', data)
         name = f'Navi {identifier}'
         device = request_message.remote_device
@@ -183,10 +185,14 @@ class XBee2UDP(object):
                         if mav_msgs:
                             vehicle.queue_in.extend(mav_msgs)
                 else:
-                    self.new_uav(rx_packet)  # Unknown transmitter - reply to connection request
-                    time.sleep(0.01)
-                    self.xbee.flush_queues()  # XBee queue may contain multiple connection requests from this device
-                    time.sleep(0.01)
+                    try:
+                        self.new_uav(rx_packet)  # Unknown transmitter - reply to connection request
+                        time.sleep(0.01)
+                        self.xbee.flush_queues()  # XBee queue may contain multiple connection requests from this device
+                        time.sleep(0.01)
+                    except Exception as e:
+                        logging.exception(e)
+
 
                 rx_packet = self.xbee.read_data()
 
@@ -243,8 +249,8 @@ def main(ip, baud_rate):
     :param ip: IP address for MAVLink UDP connection with GCS
     :param baud_rate: Baud rate (bits per second) for serial communications with XBee radio.
     """
-    xb_port = device_finder('XBee')
-    software_adapter = XBee2UDP(ip, xb_port, baud_rate)
+    #xb_port = device_finder('XBee')
+    software_adapter = XBee2UDP(ip, "/dev/ttyUSB0", baud_rate)
     software_adapter.start()
 
     try:

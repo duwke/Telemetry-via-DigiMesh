@@ -17,7 +17,7 @@
 
     "debug_file_handler": {
       "class": "logging.handlers.RotatingFileHandler",
-      "level": "DEBUG",
+      "level": "INFO",
       "formatter": "simple",
       "filename": "logs/px4_debug.log",
       "maxBytes": 10485760,

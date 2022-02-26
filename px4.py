@@ -19,7 +19,7 @@ import threading
 import argparse
 import json
 import struct
-from digi.xbee.devices import XBeeDevice, RemoteXBeeDevice
+from digi.xbee.devices import DigiMeshDevice, RemoteXBeeDevice
 from digi.xbee.exception import XBeeException
 from digi.xbee.util.utils import bytes_to_int
 from pymavlink import mavutil
@@ -66,7 +66,7 @@ class PX4Adapter:
         self.running = False
         self.px4 = None
         self.udp_str = udp_str
-        self.px4_port = device_finder('FT232R USB UART')
+        self.px4_port = '/dev/ttyACM0' # device_finder('FT232R USB UART')
         self.usbcam = usbcam
 
     def start(self):
@@ -131,76 +131,82 @@ class PX4Adapter:
         II.  Transmit bytes buffer to GCS via coordinator XBee
         III. Check for messages from coordinator, forward on to PX4 serial connection
         """
-        while not self.running:
-            time.sleep(0.01)
+        while True:
+            while not self.running:
+                time.sleep(0.01)
 
-        xbee_port = device_finder('XBee')
-        xbee = XBeeDevice(xbee_port, XBEE_MAX_BAUD)
-        xbee.open()
-        coordinator = self.find_coordinator(xbee)
+            xbee_port = '/dev/ttyUSB0' #device_finder('XBee')
+            xbee = DigiMeshDevice(xbee_port, 57600)
+            xbee.open()
+            coordinator = self.find_coordinator(xbee)
 
-        logging.info('Started XBee message handling loop')
-        while self.running:
-            # I. Consume queue_out and add to a buffer of bytes
-            tx_buffer = b''
-            while self.queue_out:
-                msg_bytes = self.process_mav_message()
-                tx_buffer += msg_bytes
+            logging.info('Started XBee message handling loop')
+            while self.running and coordinator != None:
+                # I. Consume queue_out and add to a buffer of bytes
+                tx_buffer = b''
+                while self.queue_out:
+                    msg_bytes = self.process_mav_message()
+                    tx_buffer += msg_bytes
 
-            # II. Transmit buffered bytes, catch exceptions raised if connection has been lost
-            try:
-                while tx_buffer:
-                    xbee.send_data(coordinator, tx_buffer[:XBEE_PKT_SIZE])
-                    tx_buffer = tx_buffer[XBEE_PKT_SIZE:]
-                message = xbee.read_data()  # Read XBee for Coordinator messages
-            except XBeeException:
-                reconnect_blocker(xbee, coordinator)  # Block script until coordinator has been reconnected
-                self.queue_out.clear()  # Clear queue once reconnected
-                continue
+                # II. Transmit buffered bytes, catch exceptions raised if connection has been lost
+                try:
+                    while tx_buffer:
+                        xbee.send_data(coordinator, tx_buffer[:XBEE_PKT_SIZE])
+                        tx_buffer = tx_buffer[XBEE_PKT_SIZE:]
+                    message = xbee.read_data()  # Read XBee for Coordinator messages
+                except XBeeException:
+                    reconnect_blocker(xbee, coordinator)  # Block script until coordinator has been reconnected
+                    self.queue_out.clear()  # Clear queue once reconnected
+                    continue
 
-            # III. Check whether a message was actually received, wait if no message and loop
-            while message:
-                # Check who the message is from
-                if message.remote_device != coordinator:
-                    # Message from another endpoint searching for a coordinator
-                    logging.info('Message from another endpoint received.')
-                    xbee.send_data(message.remote_device, b'ENDPT')
+                # III. Check whether a message was actually received, wait if no message and loop
+                while message:
+                    # Check who the message is from
+                    if message.remote_device != coordinator:
+                        # Message from another endpoint searching for a coordinator
+                        logging.info('Message from another endpoint received.')
+                        xbee.send_data(message.remote_device, b'ENDPT')
 
-                elif message.is_broadcast:
-                    # If broadcast trigger handover !!! TODO
-                    logging.warning('Message broadcast received - Coordinator handover initiated.')
-                    self.old_coordinators.append(coordinator)
-                    self.queue_out.clear()
-                    self.stop()
-                    time.sleep(0.01)
-                    break
+                    elif message.is_broadcast:
+                        # If broadcast trigger handover !!! TODO
+                        logging.warning('Message broadcast received - Coordinator handover initiated.')
+                        self.old_coordinators.append(coordinator)
+                        self.queue_out.clear()
+                        self.stop()
+                        time.sleep(0.01)
+                        break
 
-                else:
-                    # Message received is from coordinator, read data and pass onto PX4
-                    data = message.data
-                    try:
-                        messages = self.parser.parse_buffer(data)
-                    except mavlink.MAVError:
-                        logging.exception(f'MAVError: {data}')
                     else:
-                        for gcs_msg in messages:
-                            msg_type = gcs_msg.get_type()
+                        # Message received is from coordinator, read data and pass onto PX4
+                        data = message.data
+                        try:
+                            messages = self.parser.parse_buffer(data)
+                        except mavlink.MAVError:
+                            logging.exception(f'MAVError: {data}')
+                        else:
+                            for gcs_msg in messages:
+                                msg_type = gcs_msg.get_type()
 
-                            # Check for special message types
-                            if msg_type == 'HEARTBEAT':
-                                self.heartbeat(xbee, coordinator)
+                                # Check for special message types
+                                if msg_type == 'HEARTBEAT':
+                                    self.heartbeat(xbee, coordinator)
 
-                            if msg_type not in MAV_IGNORES:
-                                self.px4.write(gcs_msg.get_msgbuf())  # Write data from received message to PX4
+                                if msg_type not in MAV_IGNORES:
+                                    self.px4.write(gcs_msg.get_msgbuf())  # Write data from received message to PX4
+                    last_message_received = datetime.datetime.now()
+                    message = self.read_xbee_data(xbee, coordinator)
 
-                message = self.read_xbee_data(xbee, coordinator)
+                time.sleep(0.001)
 
-            time.sleep(0.001)
+                # close this connection if we haven't heard from the base in over 15s
+                if (datetime.datetime.now()- last_message_received).total_seconds()  > 15:
+                    logging.warning("Closing connection to coordinator")
+                    coordinator = None
 
-        # Device closed
-        xbee.close()
+            # Device closed
+            xbee.close()
 
-    def read_xbee_data(self, xbee: XBeeDevice, coordinator: RemoteXBeeDevice):
+    def read_xbee_data(self, xbee: DigiMeshDevice, coordinator: RemoteXBeeDevice):
         """
         Error tolerant XBee reading - returns an XBee packed upon a successful read - otherwise None if an error occurs
         due to the link between xbee and coordinator radios being compromised.
@@ -247,7 +253,7 @@ class PX4Adapter:
                 pass
             elif mav_type not in self.rates:  # Priority Message
                 self.queue_out.write(msg, priority=True)
-                logging.info(f'Priority message type: {mav_type}')
+                #logging.info(f'Priority message type: {mav_type}')
             elif time.time() >= self.next_times[mav_type]:  # Scheduled message
                 self.next_times[mav_type] = time.time() + self.rates[mav_type]
                 self.queue_out.write(msg, priority=False)
@@ -268,7 +274,7 @@ class PX4Adapter:
         self.seq += 1
         return buffer
 
-    def heartbeat(self, xbee: XBeeDevice, coordinator: RemoteXBeeDevice):
+    def heartbeat(self, xbee: DigiMeshDevice, coordinator: RemoteXBeeDevice):
         """
         HEARTBEAT reply/"acknowledgement"
         Need to manually construct a RADIO_STATUS MAVLink message and place it at the front of
@@ -288,7 +294,7 @@ class PX4Adapter:
         radio_status_msg.pack(self.px4.mav)
         self.queue_out.write(radio_status_msg)
 
-    def find_coordinator(self, xbee: XBeeDevice):
+    def find_coordinator(self, xbee: DigiMeshDevice):
         """
         Finds the coordinator XBee radio for targeting MAVLink data transmission
 
@@ -315,7 +321,7 @@ class PX4Adapter:
                     if check is True:
                         return device
 
-    def check_coordinator(self, xbee: XBeeDevice, remote: RemoteXBeeDevice):
+    def check_coordinator(self, xbee: DigiMeshDevice, remote: RemoteXBeeDevice):
         """
         Checks whether an unknown XBee device corresponds to a coordinator
 
@@ -323,32 +329,34 @@ class PX4Adapter:
         :param remote: Remote XBee radio
         :return: None if timeout awaiting reply, True if remote is a coordinator, False if an endpoint
         """
-        identifier = self.settings['id']
-        port = self.settings['port']
-        data = struct.pack('>BH', identifier, port)
-        xbee.send_data(remote, data)
-        rx_packet = xbee.read_data_from(remote)
-        start = time.time()
-        logging.info('Awaiting response or 5s timeout')
-
-        while not rx_packet and time.time() - start < 5:
+        ret = False
+        while ret != True:
+            identifier = self.settings['id']
+            port = self.settings['port']
+            data = struct.pack('>BH', identifier, port)
+            xbee.send_data(remote, data)
             rx_packet = xbee.read_data_from(remote)
-            time.sleep(0.1)
+            start = time.time()
+            logging.info('Awaiting response or 5s timeout')
 
-        if not rx_packet:
-            msg = f'No response: {remote}'
-            ret = None
-        elif rx_packet.data == b'COORD':
-            msg = f'Coordinator found: {remote}'
-            self.known_endpoints.append(remote)
-            ret = True
-        elif rx_packet.data == b'ENDPT':
-            msg = f'Endpoint found: {remote}'
-            ret = False
-        else:
-            except_msg = f'Unexpected data packet {rx_packet.data}'
-            logging.exception(except_msg)
-            raise Exception(except_msg)
+            while not rx_packet and time.time() - start < 5:
+                rx_packet = xbee.read_data_from(remote)
+                time.sleep(0.1)
+
+            if not rx_packet:
+                msg = f'No response: {remote}'
+                ret = None
+            elif rx_packet.data == b'COORD':
+                msg = f'Coordinator found: {remote}'
+                self.known_endpoints.append(remote)
+                ret = True
+            elif rx_packet.data == b'ENDPT':
+                msg = f'Endpoint found: {remote}'
+                ret = False
+            else:
+                except_msg = f'Unexpected data packet {rx_packet.data}'
+                logging.exception(except_msg)
+                ret = False
 
         logging.info(msg)
         return ret
